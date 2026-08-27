@@ -1,0 +1,11 @@
+[package]
+name = "kaze-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

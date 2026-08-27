@@ -1,0 +1,22 @@
+[package]
+name = "kaze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kaze"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+gpui-component = { workspace = true }
+gpui-component-assets = { workspace = true }
+kaze-shared = { path = "../shared" }
+kaze-file-list = { path = "../file_list" }
+kaze-sidebar = { path = "../sidebar" }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+rust-embed = "8"
