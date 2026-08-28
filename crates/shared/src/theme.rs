@@ -76,9 +76,20 @@ pub fn apply_omarchy_theme(cx: &mut App) {
     }
     if let Some(&accent) = colors.get("accent") {
         c.accent = accent;
+        c.ring = accent;
+        c.drop_target = accent;
+        c.drag_border = accent;
     }
     if let Some(&bright_fg) = colors.get("bright_foreground") {
         c.accent_foreground = bright_fg;
+    }
+    if let Some(&red) = colors.get("red") {
+        c.danger = red;
+        c.danger_active = red;
+        c.danger_hover = red;
+    }
+    if let Some(&bright_red) = colors.get("bright_red") {
+        c.danger_foreground = bright_red;
     }
     if let Some(&muted) = colors.get("muted") {
         c.muted = muted;

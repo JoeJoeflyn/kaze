@@ -158,10 +158,10 @@ impl Render for SidebarView {
                                 }
                             },
                         ))
-                        .drag_over::<FileDrag>(|this, _drag, _window, _cx| {
-                            this.bg(gpui::hsla(0.0, 0.85, 0.55, 0.40))
+                        .drag_over::<FileDrag>(|this, _drag, _window, cx| {
+                            this.bg(cx.theme().danger.alpha(0.18))
                                 .border_1()
-                                .border_color(gpui::hsla(0.0, 0.9, 0.6, 0.9))
+                                .border_color(cx.theme().danger)
                                 .rounded_md()
                         })
                     })
@@ -176,9 +176,9 @@ impl Render for SidebarView {
                             }
                         ))
                         .drag_over::<FileDrag>(|this, _drag, _window, cx| {
-                            this.bg(cx.theme().accent.alpha(0.35))
+                            this.bg(cx.theme().drop_target.alpha(0.35))
                                 .border_1()
-                                .border_color(cx.theme().accent)
+                                .border_color(cx.theme().drag_border)
                                 .rounded_md()
                         })
                     })

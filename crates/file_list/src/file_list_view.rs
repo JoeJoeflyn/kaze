@@ -29,7 +29,9 @@ actions!(
         OpenSelected,
         SelectAll,
         CloseModal,
-        ConfirmModal
+        ConfirmModal,
+        ToggleReduceMotion,
+        Undo
     ]
 );
 
@@ -116,6 +118,16 @@ pub enum ModalState {
     GetInfo {
         entry: FileEntry,
     },
+    ConfirmDelete {
+        path: PathBuf,
+        is_dir: bool,
+    },
+}
+
+#[derive(Clone)]
+struct UndoEntry {
+    original_path: PathBuf,
+    trash_path: PathBuf,
 }
 
 struct RowRenderContext {
@@ -125,6 +137,8 @@ struct RowRenderContext {
     entity: Entity<FileListView>,
     deletion_progress: Option<f32>,
     muted_foreground: gpui::Hsla,
+    accent: gpui::Hsla,
+    muted: gpui::Hsla,
 }
 
 pub fn horizontal_wheel_delta(delta_x: f32, delta_y: f32, shift_held: bool) -> Option<f32> {
@@ -170,10 +184,10 @@ impl gpui::Render for FileDragGhost {
             .px_3()
             .py_1p5()
             .rounded_lg()
-            .bg(theme.popover.alpha(0.95))
+            .bg(theme.popover.alpha(0.78))
             .border_1()
             .border_color(theme.accent)
-            .shadow_lg()
+            .shadow_xl()
             .text_sm()
             .child(
                 Icon::new(icon)
@@ -203,10 +217,10 @@ impl gpui::Render for FileDrag {
             .px_3()
             .py_1p5()
             .rounded_lg()
-            .bg(theme.popover.alpha(0.95))
+            .bg(theme.popover.alpha(0.78))
             .border_1()
             .border_color(theme.accent)
-            .shadow_lg()
+            .shadow_xl()
             .text_sm()
             .child(
                 Icon::new(icon)
@@ -426,7 +440,8 @@ pub struct FileListView {
     search_results: Vec<FileEntry>,
     searching: bool,
     last_click: Option<(usize, usize, Instant)>,
-    last_drag_x: Option<Pixels>,
+    col_drag_start_x: Option<Pixels>,
+    col_drag_start_width: f32,
     show_hidden: bool,
     search_generation: u64,
     list_scroll: UniformListScrollHandle,
@@ -440,6 +455,9 @@ pub struct FileListView {
     dragged_path: Option<PathBuf>,
     sidebar_collapsed: bool,
     modal_state: ModalState,
+    last_error: Option<(String, Instant)>,
+    reduce_motion: bool,
+    undo_stack: Vec<UndoEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -489,7 +507,8 @@ impl FileListView {
             search_results: vec![],
             searching: false,
             last_click: None,
-            last_drag_x: None,
+            col_drag_start_x: None,
+            col_drag_start_width: 0.0,
             show_hidden: false,
             search_generation: 0,
             list_scroll: UniformListScrollHandle::new(),
@@ -503,6 +522,9 @@ impl FileListView {
             dragged_path: None,
             sidebar_collapsed: false,
             modal_state: ModalState::None,
+            last_error: None,
+            reduce_motion: false,
+            undo_stack: vec![],
         }
     }
 
@@ -725,7 +747,7 @@ impl FileListView {
 
         let path = unique_child_path(&parent, "Untitled Folder");
         if let Err(err) = std::fs::create_dir(&path) {
-            eprintln!("Kaze: failed to create {}: {}", path.display(), err);
+            self.set_error(format!("Failed to create folder: {}", err), cx);
             return;
         }
 
@@ -835,8 +857,11 @@ impl FileListView {
                     if let Some(parent) = path.parent() {
                         let target = parent.join(&new_name);
                         if target != *path {
-                            let _ = std::fs::rename(path, &target);
-                            self.refresh(cx);
+                            if let Err(err) = std::fs::rename(path, &target) {
+                                self.set_error(format!("Failed to rename: {}", err), cx);
+                            } else {
+                                self.refresh(cx);
+                            }
                         }
                     }
                 }
@@ -847,8 +872,11 @@ impl FileListView {
                 let name = input.read(cx).value().trim().to_string();
                 if !name.is_empty() {
                     let target = parent.join(&name);
-                    let _ = std::fs::create_dir(&target);
-                    self.refresh(cx);
+                    if let Err(err) = std::fs::create_dir(&target) {
+                        self.set_error(format!("Failed to create folder: {}", err), cx);
+                    } else {
+                        self.refresh(cx);
+                    }
                 }
                 self.modal_state = ModalState::None;
                 cx.notify();
@@ -857,13 +885,32 @@ impl FileListView {
                 let name = input.read(cx).value().trim().to_string();
                 if !name.is_empty() {
                     let target = parent.join(&name);
-                    let _ = std::fs::File::create(&target);
-                    self.refresh(cx);
+                    if let Err(err) = std::fs::File::create(&target) {
+                        self.set_error(format!("Failed to create file: {}", err), cx);
+                    } else {
+                        self.refresh(cx);
+                    }
                 }
                 self.modal_state = ModalState::None;
                 cx.notify();
             }
             ModalState::GetInfo { .. } => {
+                self.modal_state = ModalState::None;
+                cx.notify();
+            }
+            ModalState::ConfirmDelete { path, is_dir } => {
+                let path = path.clone();
+                let is_dir = *is_dir;
+                let path_for_fs = path.clone();
+                cx.background_spawn(async move {
+                    if is_dir {
+                        let _ = std::fs::remove_dir_all(&path_for_fs);
+                    } else {
+                        let _ = std::fs::remove_file(&path_for_fs);
+                    }
+                })
+                .detach();
+                self.delete_file_by_path(&path, cx);
                 self.modal_state = ModalState::None;
                 cx.notify();
             }
@@ -933,8 +980,52 @@ impl FileListView {
         if let Some(col) = self.columns.last_mut() {
             if !col.entries.is_empty() {
                 col.selected = Some(0);
+                // ponytail: real multi-select needs a HashSet; for now select first as anchor
             }
         }
+        cx.notify();
+    }
+
+    fn set_error(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.last_error = Some((msg, Instant::now()));
+        cx.notify();
+        // Auto-clear after 4s
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(4))
+                .await;
+            this.update(cx, |this, cx| {
+                this.last_error = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_reduce_motion(&mut self, cx: &mut Context<Self>) {
+        self.reduce_motion = !self.reduce_motion;
+        cx.notify();
+    }
+
+    fn undo_last_delete(&mut self, cx: &mut Context<Self>) {
+        // ponytail: real undo needs trash-info parsing to find the trashed path;
+        // this is a stub that restores from the most recent trash entry if found.
+        if let Some(entry) = self.undo_stack.pop() {
+            let original = entry.original_path.clone();
+            let trash = entry.trash_path.clone();
+            cx.background_spawn(async move {
+                let _ = std::fs::rename(&trash, &original);
+            })
+            .detach();
+            self.refresh(cx);
+        } else {
+            self.set_error("Nothing to undo".to_string(), cx);
+        }
+    }
+
+    fn confirm_permanent_delete(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+        self.modal_state = ModalState::ConfirmDelete { path, is_dir };
         cx.notify();
     }
 
@@ -946,7 +1037,7 @@ impl FileListView {
         let is_double = self
             .last_click
             .map(|(c, e, t)| {
-                c == col_ix && e == entry_ix && now.duration_since(t) < Duration::from_millis(400)
+                c == col_ix && e == entry_ix && now.duration_since(t) < Duration::from_millis(270)
             })
             .unwrap_or(false);
 
@@ -1006,10 +1097,32 @@ impl FileListView {
     pub fn animate_trash_drop_by_path(&mut self, path: &PathBuf, cx: &mut Context<Self>) {
         self.dragged_path = None;
 
+        if self.reduce_motion {
+            // Skip the flight animation; just queue the deletion collapse
+            let path_clone = path.clone();
+            cx.background_spawn(async move {
+                if is_in_trash(&path_clone) {
+                    if path_clone.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path_clone);
+                    } else {
+                        let _ = std::fs::remove_file(&path_clone);
+                    }
+                } else {
+                    let _ = kaze_shared::move_to_trash(&path_clone);
+                }
+            })
+            .detach();
+            self.queue_deletion(path.clone(), cx);
+            return;
+        }
+
         let mut flight_info: Option<(bool, f32, f32)> = None;
         for (col_ix, col) in self.columns.iter().enumerate() {
             for (entry_ix, entry) in col.entries.iter().enumerate() {
                 if entry.path == *path {
+                    // Approximate position: column offset + row offset.
+                    // ponytail: real fix needs measured screen bounds from the sidebar Trash item;
+                    // target the left edge where the sidebar Trash icon lives.
                     let start_x = (col_ix as f32) * 220.0 + 80.0;
                     let start_y = (entry_ix as f32) * 28.0 + 60.0;
                     flight_info = Some((entry.is_dir(), start_x, start_y));
@@ -1022,11 +1135,12 @@ impl FileListView {
         }
 
         if let Some((is_dir, start_x, start_y)) = flight_info {
+            // Target: fly toward the sidebar Trash icon (left edge, ~bottom area)
             self.trash_flights.push(TrashFlight {
                 is_dir,
                 start_x,
                 start_y,
-                target_x: -50.0,
+                target_x: 24.0,
                 target_y: 260.0,
                 started_at: Instant::now(),
             });
@@ -1277,6 +1391,12 @@ impl Render for FileListView {
             .on_action(cx.listener(|this, _: &ConfirmModal, _window, cx| {
                 this.confirm_modal(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleReduceMotion, _window, cx| {
+                this.toggle_reduce_motion(cx);
+            }))
+            .on_action(cx.listener(|this, _: &Undo, _window, cx| {
+                this.undo_last_delete(cx);
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -1284,6 +1404,7 @@ impl Render for FileListView {
                     .px_3()
                     .py_2()
                     .flex_shrink_0()
+                    .bg(theme.background.alpha(0.85))
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
@@ -1409,22 +1530,38 @@ impl Render for FileListView {
                                 }),
                         )
                     })
-                    .child(
+                    .child({
+                        // Sliding active pill: absolute indicator moves between the two slots
+                        // ponytail: real spring needs GPUI animation API; this is a static
+                        // position swap that reads as a sliding pill on the next frame.
+                        let entity_cols = entity.clone();
+                        let entity_list = entity.clone();
+                        let pill_left = view_mode == ViewMode::Columns;
                         h_flex()
                             .items_center()
+                            .relative()
                             .gap_1()
                             .p_1()
                             .rounded_md()
                             .bg(theme.muted_foreground.alpha(0.08))
-                            .child({
-                                let entity = entity.clone();
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(gpui::px(4.0))
+                                    .bottom(gpui::px(4.0))
+                                    .left(gpui::px(if pill_left { 4.0 } else { 32.0 }))
+                                    .w(gpui::px(24.0))
+                                    .rounded_sm()
+                                    .bg(theme.sidebar_accent),
+                            )
+                            .child(
                                 div()
                                     .id("columns-view")
                                     .p_1()
-                                    .rounded_sm()
+                                    .w(gpui::px(24.0))
+                                    .flex_shrink_0()
                                     .when(view_mode == ViewMode::Columns, |this| {
-                                        this.bg(theme.sidebar_accent)
-                                            .text_color(theme.sidebar_accent_foreground)
+                                        this.text_color(theme.sidebar_accent_foreground)
                                     })
                                     .when(view_mode != ViewMode::Columns, |this| {
                                         this.text_color(theme.muted_foreground).hover(|this| {
@@ -1436,20 +1573,19 @@ impl Render for FileListView {
                                         cx.new(|_| Tooltip::new("Columns view")).into()
                                     })
                                     .on_click(move |_, _, cx| {
-                                        entity.update(cx, |this, cx| {
+                                        entity_cols.update(cx, |this, cx| {
                                             this.set_view_mode(ViewMode::Columns, cx);
                                         });
-                                    })
-                            })
-                            .child({
-                                let entity = entity.clone();
+                                    }),
+                            )
+                            .child(
                                 div()
                                     .id("list-view")
                                     .p_1()
-                                    .rounded_sm()
+                                    .w(gpui::px(24.0))
+                                    .flex_shrink_0()
                                     .when(view_mode == ViewMode::List, |this| {
-                                        this.bg(theme.sidebar_accent)
-                                            .text_color(theme.sidebar_accent_foreground)
+                                        this.text_color(theme.sidebar_accent_foreground)
                                     })
                                     .when(view_mode != ViewMode::List, |this| {
                                         this.text_color(theme.muted_foreground).hover(|this| {
@@ -1459,12 +1595,12 @@ impl Render for FileListView {
                                     .child(Icon::new(IconName::Menu).small())
                                     .tooltip(|_, cx| cx.new(|_| Tooltip::new("List view")).into())
                                     .on_click(move |_, _, cx| {
-                                        entity.update(cx, |this, cx| {
+                                        entity_list.update(cx, |this, cx| {
                                             this.set_view_mode(ViewMode::List, cx);
                                         });
-                                    })
-                            }),
-                    )
+                                    }),
+                            )
+                    })
                     .child(
                         h_flex().w(gpui::px(240.0)).child(
                             Input::new(&self.search)
@@ -1494,6 +1630,14 @@ impl Render for FileListView {
                         format!("{} search results", search_result_count)
                     } else {
                         format!("{} items", current_item_count)
+                    })
+                    .when_some(self.last_error.as_ref(), |this, (msg, _)| {
+                        this.child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_color(theme.danger_foreground)
+                                    .child(msg.clone()),
+                            )
                     }),
             )
             .children(trash_flights.into_iter().enumerate().map(|(ix, flight)| {
@@ -1527,14 +1671,23 @@ impl Render for FileListView {
                     let col_ix = event.drag(cx).0;
                     let current_x = event.event.position.x;
                     entity.update(cx, |this, cx| {
-                        if let Some(last_x) = this.last_drag_x {
-                            let delta = (current_x - last_x).as_f32();
+                        if this.col_drag_start_x.is_none() {
+                            this.col_drag_start_x = Some(current_x);
+                            this.col_drag_start_width = this.columns.get(col_ix).map(|c| c.width).unwrap_or(MIN_COL_WIDTH);
+                        }
+                        if let Some(start_x) = this.col_drag_start_x {
+                            let raw = this.col_drag_start_width + (current_x - start_x).as_f32();
+                            let clamped = if raw < MIN_COL_WIDTH {
+                                MIN_COL_WIDTH - (MIN_COL_WIDTH - raw) * 0.45
+                            } else if raw > MAX_COL_WIDTH {
+                                MAX_COL_WIDTH + (raw - MAX_COL_WIDTH) * 0.45
+                            } else {
+                                raw
+                            };
                             if let Some(col) = this.columns.get_mut(col_ix) {
-                                col.width =
-                                    (col.width + delta).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+                                col.width = clamped;
                             }
                         }
-                        this.last_drag_x = Some(current_x);
                         cx.notify();
                     });
                 }
@@ -1543,7 +1696,11 @@ impl Render for FileListView {
                 let entity = entity.clone();
                 move |_, _, cx| {
                     entity.update(cx, |this, cx| {
-                        this.last_drag_x = None;
+                        // Snap rubber-band back to clamp
+                        for col in &mut this.columns {
+                            col.width = col.width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+                        }
+                        this.col_drag_start_x = None;
                         cx.notify();
                     });
                 }
@@ -1556,6 +1713,10 @@ impl FileListView {
         let theme = cx.theme().clone();
         let border_color = theme.border;
         let muted_foreground = theme.muted_foreground;
+        let accent_color = theme.accent;
+        let muted_color = theme.muted;
+        let empty_icon_color = theme.muted_foreground.alpha(0.4);
+        let empty_text_color = theme.muted_foreground;
         let entity = cx.entity();
 
         let col_meta: Vec<(UniformListScrollHandle, usize, Option<usize>, f32, PathBuf)> = self
@@ -1596,16 +1757,30 @@ impl FileListView {
                                 .flex_shrink_0()
                                 .when(item_count == 0, |this| {
                                     this.child(
-                                        div()
+                                        v_flex()
                                             .id(("col-empty", col_ix))
                                             .size_full()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_2()
                                             .context_menu(move |menu, _window, _cx| {
                                                 build_background_context_menu(
                                                     menu,
                                                     &col_path_bg,
                                                     entity_bg.clone(),
                                                 )
-                                            }),
+                                            })
+                                            .child(
+                                                Icon::new(IconName::FolderOpen)
+                                                    .large()
+                                                    .text_color(empty_icon_color),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(empty_text_color)
+                                                    .child("No Items"),
+                                            ),
                                     )
                                 })
                                 .when(item_count > 0, |this| {
@@ -1639,6 +1814,8 @@ impl FileListView {
                                                                     entity,
                                                                     deletion_progress,
                                                                     muted_foreground,
+                                                                    accent: accent_color,
+                                                                    muted: muted_color,
                                                                 },
                                                             )
                                                         })
@@ -1892,6 +2069,7 @@ impl FileListView {
         let item_count = self.search_results.len();
         let entity = cx.entity();
         let scroll = self.search_scroll.clone();
+        let theme = cx.theme().clone();
 
         v_flex()
             .id("search-container")
@@ -1910,7 +2088,7 @@ impl FileListView {
                                     range
                                         .map(|ix| {
                                             let entry = &this.search_results[ix];
-                                            render_search_item(ix, entry, entity.clone())
+                                            render_search_item(ix, entry, entity.clone(), &theme)
                                         })
                                         .collect()
                                 },
@@ -1941,7 +2119,7 @@ impl FileListView {
                         .id("modal-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .bg(theme.overlay)
                         .items_center()
                         .justify_center()
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -1952,7 +2130,7 @@ impl FileListView {
                             v_flex()
                                 .id("modal-card")
                                 .w(gpui::px(380.0))
-                                .bg(theme.background)
+                                .bg(theme.popover)
                                 .border_1()
                                 .border_color(theme.border)
                                 .rounded_lg()
@@ -2024,7 +2202,7 @@ impl FileListView {
                         .id("modal-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .bg(theme.overlay)
                         .items_center()
                         .justify_center()
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -2035,7 +2213,7 @@ impl FileListView {
                             v_flex()
                                 .id("modal-card")
                                 .w(gpui::px(380.0))
-                                .bg(theme.background)
+                                .bg(theme.popover)
                                 .border_1()
                                 .border_color(theme.border)
                                 .rounded_lg()
@@ -2107,7 +2285,7 @@ impl FileListView {
                         .id("modal-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .bg(theme.overlay)
                         .items_center()
                         .justify_center()
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -2118,7 +2296,7 @@ impl FileListView {
                             v_flex()
                                 .id("modal-card")
                                 .w(gpui::px(380.0))
-                                .bg(theme.background)
+                                .bg(theme.popover)
                                 .border_1()
                                 .border_color(theme.border)
                                 .rounded_lg()
@@ -2206,7 +2384,7 @@ impl FileListView {
                         .id("modal-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .bg(theme.overlay)
                         .items_center()
                         .justify_center()
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -2217,7 +2395,7 @@ impl FileListView {
                             v_flex()
                                 .id("modal-card")
                                 .w(gpui::px(420.0))
-                                .bg(theme.background)
+                                .bg(theme.popover)
                                 .border_1()
                                 .border_color(theme.border)
                                 .rounded_lg()
@@ -2313,6 +2491,107 @@ impl FileListView {
                                                 }
                                             }),
                                     ),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            }
+            ModalState::ConfirmDelete { path, is_dir } => {
+                let entity_cancel = entity.clone();
+                let entity_confirm = entity.clone();
+                let path_confirm = path.clone();
+                let is_dir_confirm = *is_dir;
+                let display_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                let kind_label = if *is_dir { "folder" } else { "file" };
+                Some(
+                    div()
+                        .id("modal-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(theme.overlay)
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            entity_cancel.update(cx, |this, cx| this.close_modal(cx));
+                        })
+                        .child(
+                            v_flex()
+                                .id("modal-card")
+                                .w(gpui::px(380.0))
+                                .bg(theme.popover)
+                                .border_1()
+                                .border_color(theme.border)
+                                .rounded_lg()
+                                .shadow_lg()
+                                .p_4()
+                                .gap_3()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::Delete)
+                                                .small()
+                                                .text_color(theme.danger_foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_sm()
+                                                .child("Delete Permanently"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!(
+                                            "“{}” will be permanently deleted. This {} cannot be undone.",
+                                            display_name, kind_label
+                                        )),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("btn-cancel-del")
+                                                .child("Cancel")
+                                                .ghost()
+                                                .on_click({
+                                                    let entity = entity.clone();
+                                                    move |_, _, cx| {
+                                                        entity.update(cx, |this, cx| {
+                                                            this.close_modal(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("btn-confirm-del")
+                                                .child("Delete")
+                                                .danger()
+                                                .on_click(move |_, _, cx| {
+                                                    entity_confirm.update(cx, |this, cx| {
+                                                        let path_clone = path_confirm.clone();
+                                                        cx.background_spawn(async move {
+                                                            if is_dir_confirm {
+                                                                let _ = std::fs::remove_dir_all(&path_clone);
+                                                            } else {
+                                                                let _ = std::fs::remove_file(&path_clone);
+                                                            }
+                                                        })
+                                                        .detach();
+                                                        this.delete_file_by_path(&path_confirm, cx);
+                                                        this.close_modal(cx);
+                                                    });
+                                                }),
+                                        ),
                                 ),
                         )
                         .into_any_element(),
@@ -2503,22 +2782,14 @@ fn build_item_context_menu(
     if in_trash {
         // If already inside trash, DO NOT show "Move to Trash", show ONLY "Delete Permanently"
         let path = path.clone();
+        let is_dir_perm = is_dir;
         let entity = entity.clone();
         menu = menu.item(
             PopupMenuItem::new("Delete Permanently")
                 .icon(IconName::Delete)
                 .on_click(move |_, _window, cx| {
-                    let path_for_del = path.clone();
-                    cx.background_spawn(async move {
-                        if path_for_del.is_dir() {
-                            let _ = std::fs::remove_dir_all(&path_for_del);
-                        } else {
-                            let _ = std::fs::remove_file(&path_for_del);
-                        }
-                    })
-                    .detach();
                     entity.update(cx, |this, cx| {
-                        this.delete_file_by_path(&path, cx);
+                        this.confirm_permanent_delete(path.clone(), is_dir_perm, cx);
                     });
                 }),
         );
@@ -2537,22 +2808,14 @@ fn build_item_context_menu(
         );
 
         let path_perm = path.clone();
+        let is_dir_perm = is_dir;
         let entity_perm = entity.clone();
         menu = menu.item(
             PopupMenuItem::new("Delete Permanently")
                 .icon(IconName::Close)
                 .on_click(move |_, _window, cx| {
-                    let path_for_del = path.clone();
-                    cx.background_spawn(async move {
-                        if path_for_del.is_dir() {
-                            let _ = std::fs::remove_dir_all(&path_for_del);
-                        } else {
-                            let _ = std::fs::remove_file(&path_for_del);
-                        }
-                    })
-                    .detach();
                     entity_perm.update(cx, |this, cx| {
-                        this.delete_file_by_path(&path_perm, cx);
+                        this.confirm_permanent_delete(path_perm.clone(), is_dir_perm, cx);
                     });
                 }),
         );
@@ -2892,6 +3155,8 @@ fn render_row(entry: &FileEntry, context: RowRenderContext) -> AnyElement {
         entity,
         deletion_progress,
         muted_foreground,
+        accent,
+        muted,
     } = context;
 
     let icon = match entry.kind {
@@ -2923,8 +3188,16 @@ fn render_row(entry: &FileEntry, context: RowRenderContext) -> AnyElement {
     let entry_context = entry.clone();
     let entity_for_menu = entity;
 
+    let icon_color = if is_selected {
+        accent
+    } else if entry.is_dir() {
+        accent
+    } else {
+        muted_foreground
+    };
+
     let row_bg = if is_selected {
-        gpui::hsla(0.0, 0.0, 0.5, 0.35)
+        accent.alpha(0.22)
     } else {
         gpui::transparent_black()
     };
@@ -2943,7 +3216,13 @@ fn render_row(entry: &FileEntry, context: RowRenderContext) -> AnyElement {
         .text_sm()
         .overflow_hidden()
         .bg(row_bg)
-        .child(Icon::new(icon).small().flex_shrink_0())
+        .when(!is_selected, |this| {
+            this.hover(|this| this.bg(muted.alpha(0.08)))
+        })
+        .when(is_selected, |this| {
+            this.border_l_2().border_color(accent)
+        })
+        .child(Icon::new(icon).small().flex_shrink_0().text_color(icon_color))
         .child(div().flex_1().truncate().child(name))
         .when(entry.has_children, |this| {
             this.child(Icon::new(IconName::ChevronRight).small().flex_shrink_0().text_color(muted_foreground.alpha(0.7)))
@@ -2984,7 +3263,12 @@ fn render_row(entry: &FileEntry, context: RowRenderContext) -> AnyElement {
     .into_any_element()
 }
 
-fn render_search_item(ix: usize, entry: &FileEntry, entity: Entity<FileListView>) -> AnyElement {
+fn render_search_item(
+    ix: usize,
+    entry: &FileEntry,
+    entity: Entity<FileListView>,
+    theme: &gpui_component::Theme,
+) -> AnyElement {
     let icon = match entry.kind {
         FileKind::Directory => IconName::Folder,
         FileKind::File => IconName::File,
@@ -3001,12 +3285,12 @@ fn render_search_item(ix: usize, entry: &FileEntry, entity: Entity<FileListView>
         .px_3()
         .h(gpui::px(ROW_HEIGHT))
         .text_sm()
-        .hover(|this| this.bg(gpui::hsla(0.0, 0.0, 1.0, 0.05)))
+        .hover(|this| this.bg(theme.muted.alpha(0.08)))
         .child(
             Icon::new(icon)
                 .small()
                 .flex_shrink_0()
-                .text_color(if entry.is_dir() { gpui::hsla(0.6, 0.7, 0.6, 1.0) } else { gpui::hsla(0.0, 0.0, 0.7, 1.0) }),
+                .text_color(if entry.is_dir() { theme.accent } else { theme.muted_foreground }),
         )
         .child(
             div()
@@ -3018,7 +3302,7 @@ fn render_search_item(ix: usize, entry: &FileEntry, entity: Entity<FileListView>
                 .flex_1()
                 .truncate()
                 .text_xs()
-                .text_color(gpui::hsla(0.0, 0.0, 0.5, 0.8))
+                .text_color(theme.muted_foreground.alpha(0.8))
                 .child(full_path_str),
         )
         .on_click(move |_, window, cx| {

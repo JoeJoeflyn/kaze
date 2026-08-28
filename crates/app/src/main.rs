@@ -6,7 +6,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Root, Sizable};
 use kaze_file_list::{
     DeleteSelected, FileListView, NavigateUp, NewFolder, OpenSelected, OpenTabRequested, Refresh,
-    SelectAll, ToggleHidden, ToggleSidebarRequested,
+    SelectAll, ToggleHidden, ToggleReduceMotion, ToggleSidebarRequested, Undo,
 };
 use kaze_shared::theme::apply_omarchy_theme;
 use kaze_sidebar::{FileTrashedEvent, SidebarPathSelectedEvent, SidebarView};
@@ -32,6 +32,8 @@ fn main() {
             KeyBinding::new("enter", OpenSelected, None),
             KeyBinding::new("ctrl-a", SelectAll, None),
             KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-z", Undo, None),
+            KeyBinding::new("ctrl-shift-m", ToggleReduceMotion, None),
         ]);
 
         cx.spawn(async move |cx| {
@@ -57,9 +59,17 @@ pub struct KazeWorkspace {
     sidebar_width: f32,
     sidebar_collapsed: bool,
     sidebar_width_before_collapse: f32,
-    last_drag_x: Option<gpui::Pixels>,
+    drag_start_x: Option<gpui::Pixels>,
+    drag_start_width: f32,
+    drag_velocity: f32,
+    last_drag_sample: Option<(gpui::Pixels, std::time::Instant)>,
     pending_new_tab: Option<PathBuf>,
 }
+
+const SIDEBAR_MIN: f32 = 140.0;
+const SIDEBAR_MAX: f32 = 500.0;
+const SPRING_STIFFNESS: f32 = 600.0;
+const SPRING_DAMPING: f32 = 42.0;
 
 actions!(kaze, [ToggleSidebar, CloseTab]);
 
@@ -119,25 +129,68 @@ impl KazeWorkspace {
             sidebar_width: 200.0,
             sidebar_collapsed: false,
             sidebar_width_before_collapse: 200.0,
-            last_drag_x: None,
+            drag_start_x: None,
+            drag_start_width: 200.0,
+            drag_velocity: 0.0,
+            last_drag_sample: None,
             pending_new_tab: None,
         }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_collapsed {
+        let target = if self.sidebar_collapsed {
             self.sidebar_collapsed = false;
-            self.sidebar_width = self.sidebar_width_before_collapse.clamp(140.0, 500.0);
+            self.sidebar_width_before_collapse.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
         } else {
             self.sidebar_width_before_collapse = self.sidebar_width;
             self.sidebar_collapsed = true;
-        }
+            0.0
+        };
         for tab in &self.tabs {
             tab.file_list.update(cx, |view, cx| {
                 view.set_sidebar_collapsed(self.sidebar_collapsed, cx);
             });
         }
-        cx.notify();
+        self.animate_sidebar_to(target, 0.0, cx);
+    }
+
+    /// Spring-animate `sidebar_width` toward `target`, carrying `initial_velocity`.
+    fn animate_sidebar_to(&mut self, target: f32, initial_velocity: f32, cx: &mut Context<Self>) {
+        let mut width = self.sidebar_width;
+        let mut velocity = initial_velocity;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let dt = 0.016;
+                let accel = (target - width) * SPRING_STIFFNESS - velocity * SPRING_DAMPING;
+                velocity += accel * dt;
+                width += velocity * dt;
+                let done = (width - target).abs() < 0.5 && velocity.abs() < 2.0;
+                let w = width;
+                this.update(cx, |this, cx| {
+                    this.sidebar_width = w;
+                    cx.notify();
+                })
+                .ok();
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Rubber-band: damped resistance past the clamp boundaries.
+    fn rubber_band(raw: f32) -> f32 {
+        if raw < SIDEBAR_MIN {
+            SIDEBAR_MIN - (SIDEBAR_MIN - raw) * 0.45
+        } else if raw > SIDEBAR_MAX {
+            SIDEBAR_MAX + (raw - SIDEBAR_MAX) * 0.45
+        } else {
+            raw
+        }
     }
 
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -202,13 +255,15 @@ impl Render for KazeWorkspace {
         let theme = cx.theme();
         let active_tab = self.active_tab;
         let sidebar_width = self.sidebar_width;
+        let sidebar_collapsed = self.sidebar_collapsed;
         let entity = cx.entity();
 
         let sidebar_panel = v_flex()
             .h_full()
-            .w(gpui::px(sidebar_width))
+            .w(gpui::px(sidebar_width.max(0.0)))
             .flex_shrink_0()
-            .bg(theme.sidebar)
+            .overflow_hidden()
+            .bg(theme.sidebar.alpha(0.88))
             .border_r_1()
             .border_color(theme.sidebar_border)
             .child(
@@ -328,7 +383,8 @@ impl Render for KazeWorkspace {
             .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
                 this.close_tab(this.active_tab, cx);
             }))
-            .when(!self.sidebar_collapsed, |this| this.child(sidebar_panel).child(drag_handle))
+            .when(!sidebar_collapsed, |this| this.child(drag_handle))
+            .child(sidebar_panel)
             .on_drag_move::<SidebarResize>({
                 let entity = entity.clone();
                 move |event, _window, cx| {
@@ -337,11 +393,22 @@ impl Render for KazeWorkspace {
                         if this.sidebar_collapsed {
                             return;
                         }
-                        if let Some(last_x) = this.last_drag_x {
-                            let delta = (current_x - last_x).as_f32();
-                            this.sidebar_width = (this.sidebar_width + delta).clamp(140.0, 500.0);
+                        // Record drag start on first move
+                        if this.drag_start_x.is_none() {
+                            this.drag_start_x = Some(current_x);
+                            this.drag_start_width = this.sidebar_width;
                         }
-                        this.last_drag_x = Some(current_x);
+                        let start_x = this.drag_start_x.unwrap();
+                        let raw = this.drag_start_width + (current_x - start_x).as_f32();
+                        this.sidebar_width = Self::rubber_band(raw);
+
+                        // Velocity sampling for release hand-off
+                        let now = std::time::Instant::now();
+                        if let Some((px, pt)) = this.last_drag_sample {
+                            let dt = pt.elapsed().as_secs_f64().max(0.001);
+                            this.drag_velocity = (current_x - px).as_f32() / dt as f32;
+                        }
+                        this.last_drag_sample = Some((current_x, now));
                         cx.notify();
                     });
                 }
@@ -350,8 +417,13 @@ impl Render for KazeWorkspace {
                 let entity = entity.clone();
                 move |_, _, cx| {
                     entity.update(cx, |this, cx| {
-                        this.last_drag_x = None;
-                        cx.notify();
+                        let velocity = this.drag_velocity;
+                        let target = this.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                        this.drag_start_x = None;
+                        this.last_drag_sample = None;
+                        this.drag_velocity = 0.0;
+                        // Spring settle with velocity hand-off (snaps rubber-band back)
+                        this.animate_sidebar_to(target, velocity, cx);
                     });
                 }
             })
